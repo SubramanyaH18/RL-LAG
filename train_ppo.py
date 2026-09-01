@@ -241,10 +241,10 @@ def train(
 
     print(
         f"\n{'='*60}\n"
-        f"  RL-LAG Track B — PPO Training\n"
+        f"  RL-LAG Track B -- PPO Training\n"
         f"  Questions: {len(questions)}   Device: {device}\n"
-        f"  Steps: {start_step} → {start_step + total_steps}\n"
-        f"  Clip ε={CLIP_EPS}  GAE λ={GAE_LAMBDA}  LR={LR}\n"
+        f"  Steps: {start_step} -> {start_step + total_steps}\n"
+        f"  Clip eps={CLIP_EPS}  GAE lam={GAE_LAMBDA}  LR={LR}\n"
         f"{'='*60}\n"
     )
 
