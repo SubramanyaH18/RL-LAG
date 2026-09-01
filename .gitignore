@@ -1,0 +1,12 @@
+.env
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+vector_db/*.faiss
+vector_db/metadata.json
+.streamlit/
+
+# PPO checkpoint weights (large; stay local / in Drive)
+checkpoints/*.pt
+

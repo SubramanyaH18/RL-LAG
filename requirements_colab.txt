@@ -1,0 +1,21 @@
+﻿# Colab T4 GPU-compatible requirements
+# Python 3.13 + NumPy 2.x + CUDA 12.x compatible
+#
+# KEY RULES FOR COLAB:
+#   1. DO NOT pin numpy<2.0 — Colab scipy/sklearn are built against numpy 2.x
+#   2. sentence-transformers>=3.0.0 — 2.x is incompatible with Python 3.13
+#   3. DO NOT add torch — Colab's CUDA build will be replaced with CPU build
+#   4. faiss-gpu — uses T4 CUDA instead of CPU-only faiss-cpu
+
+numpy>=2.0.0
+networkx>=3.3
+matplotlib>=3.7.0
+Pillow>=9.0.0
+pyvis>=0.3.2
+streamlit>=1.35.0
+sentence-transformers>=3.0.0
+faiss-gpu
+ollama>=0.5.1
+python-dotenv>=1.0.0
+datasets>=2.14.0
+pytest>=8.0.0
