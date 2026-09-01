@@ -1,0 +1,136 @@
+
+policies.py:
+  L4: 'π'  ->    π^G  graph-edge policy     — decides keep/drop for each LLM-proposed DAG edge
+  L5: 'π'  ->    π^R  retrieval-select policy — decides include/exclude for each retrieved passage
+  L6: 'π'  ->    π^C  context-keep policy   — decides keep/discard for passage in running context
+  L16: 'π'  ->    π^G  : [src_type_onehot(4), tgt_type_onehot(4), n_nodes_norm(1), n_edges_norm(1)]
+  L18: 'π'  ->    π^R  : [passage_emb(384), query_emb(384)]   total dim = 768
+  L19: 'π'  ->    π^C  : [passage_emb(384), ctx_len_norm(1)]  total dim = 385
+  L38: '─'  ->  # ── Constants ──────────────────────────────────────────────────────────────────
+  L51: '─'  ->  # ── Shared MLP trunk builder ───────────────────────────────────────────────────
+  L61: '─'  ->  # ── Policy output container ────────────────────────────────────────────────────
+  L71: '─'  ->  # ── Base actor-critic ──────────────────────────────────────────────────────────
+  L127: '─'  ->  # ── The three policy networks ──────────────────────────────────────────────────
+  L130: 'π'  ->      """π^G — decides whether to keep or drop each LLM-proposed DAG edge.
+  L145: 'π'  ->      """π^R — decides which retrieved passages to include for a node.
+  L158: 'π'  ->      """π^C — decides whether to keep a passage in the running context.
+  L170: '─'  ->  # ── Observation builders ───────────────────────────────────────────────────────
+  L186: 'π'  ->      """Build a π^G observation vector."""
+  L195: 'π'  ->      """Build a π^R observation vector."""
+  L200: 'π'  ->      """Build a π^C observation vector."""
+  L205: '─'  ->  # ── Checkpoint helpers ─────────────────────────────────────────────────────────
+  L264: '←'  ->      print(f"[checkpoint] resumed from step {step} ← {path}")
+
+reward.py:
+  L3: '→'  ->  Upgrades (Track A → Track B integration):
+  L11: 'α'  ->        + α·retrieval_presence
+  L12: 'β'  ->        + β·(1 − token_cost)
+  L13: 'γ'  ->        + γ·(1 − contradiction_penalty)
+  L14: '−'  ->        − δ·hallucination_rate
+  L54: '−'  ->      """1 − (tokens_used / budget), clipped to [0, 1].
+  L65: '≥'  ->      content token (≥4 chars) with the body of retrieved passages.  Returns the
+  L124: 'α'  ->          + α·retrieval_presence
+  L125: 'β'  ->          + β·(1 − token_cost)
+  L126: 'γ'  ->          + γ·logical_consistency
+  L127: '−'  ->          − δ·(1 − grounding)
+
+rollout.py:
+  L4: '→'  ->    Runs the complete pipeline (decompose → graph → retrieve → resolve → reward)
+  L7: 'π'  ->      1. π^G  after build_graph():    keep or drop each proposed edge
+  L8: 'π'  ->      2. π^R  after retrieve():       include or exclude each candidate passage
+  L9: 'π'  ->      3. π^C  after resolve_node():   keep or discard each passage from context
+  L47: '─'  ->  # ── Trajectory step containers ─────────────────────────────────────────────────
+  L78: '─'  ->  # ── Embedding helper (reuses the already-loaded retriever model) ───────────────
+  L92: '─'  ->  # ── π^G: graph-edge decisions ─────────────────────────────────────────────────
+  L99: 'π'  ->      """For each edge in the graph, ask π^G whether to keep it.
+  L132: '─'  ->  # ── π^R: passage-selection decisions ─────────────────────────────────────────
+  L140: 'π'  ->      """For each retrieved candidate passage, ask π^R whether to include it."""
+  L169: '─'  ->  # ── π^C: context-keep decisions ───────────────────────────────────────────────
+  L177: 'π'  ->      """For each selected passage, ask π^C whether to keep it in running context."""
+  L208: '─'  ->  # ── Credit assignment ──────────────────────────────────────────────────────────
+  L221: '─'  ->  # ── Main rollout function ─────────────────────────────────────────────────────
+  L234: '→'  ->      entire existing pipeline (decompose → graph → retrieve → resolve → reward)
+  L253: '─'  ->          # ── 1. Decompose ──────────────────────────────────────────────────────
+  L259: '─'  ->          # ── 2. π^G — prune edges ──────────────────────────────────────────────
+  L263: '─'  ->          # ── 3. Node resolution with π^R + π^C ────────────────────────────────
+  L287: 'π'  ->              # π^R — select which passages to use
+  L291: 'π'  ->              # π^C — keep passages in running context
+  L307: '─'  ->          # ── 4. Synthesis ──────────────────────────────────────────────────────
+  L320: '─'  ->          # ── 5. Reward (A6 four-component) ─────────────────────────────────────
+  L332: '─'  ->          # ── 6. Assign episode reward to all trajectory steps ──────────────────
+  L347: '─'  ->  # ── CLI smoke-test ─────────────────────────────────────────────────────────────
+
+train_ppo.py:
+  L4: 'π'  ->    Trains three small MLP policy networks (π^G, π^R, π^C from policies.py) using
+  L6: 'ε'  ->      - Clip ratio ε = 0.2         (matches the paper's stated hyperparameter)
+  L7: 'λ'  ->      - GAE λ = 0.95               (Generalized Advantage Estimation)
+  L52: 'ε'  ->  # PPO hyperparameters (clip ε matches paper, others are standard)
+  L59: '≈'  ->  GAMMA = 0.99            # discount factor (episodes are single-step, so ≈1)
+  L62: '─'  ->  # ── Question loader ────────────────────────────────────────────────────────────
+  L68: '→'  ->      can be threaded through rollout → compute_reward for the correctness term.
+  L89: '─'  ->  # ── GAE computation ───────────────────────────────────────────────────────────
+  L118: '─'  ->  # ── Per-policy PPO update ─────────────────────────────────────────────────────
+  L192: '─'  ->  # ── Training loop ─────────────────────────────────────────────────────────────
+  L220: '─'  ->      # ── Init policies + optimizers ─────────────────────────────────────────
+  L228: '─'  ->      # ── Resume from checkpoint ─────────────────────────────────────────────
+  L236: '─'  ->      # ── Load questions ─────────────────────────────────────────────────────
+  L251: '─'  ->      # ── Training loop ──────────────────────────────────────────────────────
+  L255: '─'  ->          # ── Rollout ────────────────────────────────────────────────────────
+  L262: '─'  ->          # ── PPO updates ────────────────────────────────────────────────────
+  L275: '─'  ->          # ── Logging ────────────────────────────────────────────────────────
+  L303: '─'  ->          # ── Checkpoint ─────────────────────────────────────────────────────
+  L334: '─'  ->  # ── CLI ───────────────────────────────────────────────────────────────────────
+  L336: '─'  ->  # ── Dry-run mock helpers ───────────────────────────────────────────────────────
+  L379: '→'  ->          print(f"[train_ppo] Checkpoint dir overridden → {args.checkpoint_dir}")
+
+retrieval.py:
+  L7: '→'  ->           temporal    → k+1 (timelines benefit from extra supporting passages)
+  L8: '→'  ->           comparative → min(k,2) (two-entity questions need precision over breadth)
+  L9: '→'  ->           others      → caller-supplied k unchanged
+  L105: '≥'  ->          A5: near-duplicate passages (cosine ≥ 0.92) are removed before returning.
+  L115: '→'  ->          #   temporal    → +1 (timelines often need an extra supporting passage)
+  L116: '→'  ->          #   comparative → cap at 2 (two-entity questions need precision over breadth)
+  L117: '→'  ->          #   others      → caller-supplied k unchanged
+  L158: '≥'  ->      that order and skip any candidate that is cosine-similar (≥ threshold) to an
+
+eval.py:
+  L9: 'π'  ->                               policy networks (π^G, π^R, π^C)
+  L378: '─'  ->      print("\n─── Summary ──────────────────────────────")
+  L384: '─'  ->      print("──────────────────────────────────────────")
+
+llm_client.py:
+  L26: '→'  ->  # Raised from 5 → 8: Ollama's cold-start inside a Colab VM can take 15–20 s,
+  L61: '→'  ->          print(f"[ollama] client (re)created → {host}")
+
+solver.py:
+  L177: '→'  ->          "- For yes/no questions → reply ONLY 'yes' or 'no'\n"
+  L178: '→'  ->          "- For 'what state' → give the state name only\n"
+  L179: '→'  ->          "- For 'what theater' → give the theater name only\n"
+  L180: '→'  ->          "- For 'why/what made' → give the reason/event only\n"
+  L181: '→'  ->          "- For 'what nationality' → adjective form (e.g. 'Bulgarian' not 'Bulgaria')\n"
+  L182: '→'  ->          "- For 'which genus/county/duchy' → that entity name only\n"
+  L183: '→'  ->          "- For numbers/laps/dates → exact value with unit (e.g. '25 laps')\n"
+decomposition.py: OK
+graph_builder.py: OK
+pipeline.py: OK
+
+app.py:
+  L33: '─'  ->  # ── Sidebar ───────────────────────────────────────────────────────────────────
+  L60: '─'  ->  # ── Question selection ────────────────────────────────────────────────────────
+  L96: '✅'  ->          st.success("✅ Cached run available — will replay instantly without Ollama.")
+  L98: 'ℹ'  ->          st.info("ℹ️ No cached run for this question — will run live via Ollama when you click Run pi
+  L103: '─'  ->  # ── Render helpers ────────────────────────────────────────────────────────────
+  L106: '●'  ->          f'<span style="color:{color}; font-size:1.1em;">●</span> {node_type}'
+  L118: '⚠'  ->              f"⚠️ The dependency graph has **{n_components} disconnected components**. "
+  L149: '→'  ->      normalized = max(0.0, min(1.0, (score + 0.25) / 0.5))  # map [-0.25, 0.25] → [0, 1]
+  L158: '🔍'  ->              "🔍 Retrieval presence",
+  L163: '⚡'  ->              "⚡ Token efficiency",
+  L165: '−'  ->              help="1 − (completion_tokens / 2048 token budget).",
+  L168: '✅'  ->              "✅ Logical consistency",
+  L173: '🧠'  ->              "🧠 Grounding",
+  L185: '─'  ->  # ── Pipeline execution ────────────────────────────────────────────────────────
+  L209: '⚠'  ->                      label += "  ⚠️ contradiction"
+  L247: '⏳'  ->                                  node_placeholders[item["id"]].markdown(f"⏳ `{item['id']}` queued")
+  L251: '🔄'  ->                          node_placeholders[node_id].markdown(f"🔄 Resolving `{node_id}`…")
+  L255: '⚠'  ->                              label += "  ⚠️ contradiction detected"
+  L262: '✅'  ->                          node_placeholders[node_id].markdown(f"✅ `{node_id}` resolved")

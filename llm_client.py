@@ -58,7 +58,7 @@ def _get_client() -> "ollama.Client":
     if _client is None or _client_host != host:
         _client = ollama.Client(host=host)
         _client_host = host
-        print(f"[ollama] client (re)created → {host}")
+        print(f"[ollama] client (re)created -> {host}")
     return _client
 
 

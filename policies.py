@@ -233,7 +233,7 @@ def save_checkpoint(
         },
         path,
     )
-    print(f"[checkpoint] saved → {path}")
+    print(f"[checkpoint] saved -> {path}")
     return path
 
 
@@ -261,7 +261,7 @@ def load_latest_checkpoint(
     opt_C.load_state_dict(data["opt_C_state"])
     step = data["step"]
     history = data.get("reward_history", [])
-    print(f"[checkpoint] resumed from step {step} ← {path}")
+    print(f"[checkpoint] resumed from step {step} <- {path}")
     return step, history
 
 

@@ -376,7 +376,7 @@ if __name__ == "__main__":
     if args.checkpoint_dir:
         import policies as _policies_mod
         _policies_mod.CHECKPOINT_DIR = args.checkpoint_dir
-        print(f"[train_ppo] Checkpoint dir overridden → {args.checkpoint_dir}")
+        print(f"[train_ppo] Checkpoint dir overridden -> {args.checkpoint_dir}")
 
     if args.dry_run:
         print("[train_ppo] DRY-RUN mode: LLM calls replaced with deterministic mock.")

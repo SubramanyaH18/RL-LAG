@@ -375,13 +375,13 @@ def main() -> None:
     print(f"\nResults written to {args.out}  ({elapsed:.1f}s)")
 
     # Print summary table.
-    print("\n─── Summary ──────────────────────────────")
+    print("\n--- Summary ------------------------------------")
     for system, metrics in results["summary"].items():
         print(
             f"  {system:<24}  EM={metrics['em']:.4f}  F1={metrics['f1']:.4f}"
             f"  (n={metrics['n']})"
         )
-    print("──────────────────────────────────────────")
+    print("------------------------------------------")
 
 
 if __name__ == "__main__":
