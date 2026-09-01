@@ -33,13 +33,13 @@ from eval import exact_match, f1_score
 
 TOKEN_BUDGET = 2048  # soft budget for token-cost normalisation (A6)
 
-# Correctness dominates (~50 %) so the policies learn to produce correct answers;
-# the other four terms are auxiliary shaping signals sharing the remaining 50 %.
-_W_CORRECTNESS = 0.50   # answer correctness (EM + F1 blend against gold)
-_ALPHA = 0.125          # retrieval presence
-_BETA  = 0.125          # token efficiency
-_GAMMA = 0.125          # logical consistency (no contradictions)
-_DELTA = 0.125          # grounding / anti-hallucination
+# Correctness dominates (~65%) — boosted from 0.50 to accelerate learning
+# on the focused training subset.  Auxiliary terms each share ~11.7% of weight.
+_W_CORRECTNESS = 0.65   # answer correctness (EM + F1 blend against gold)
+_ALPHA = 0.1167         # retrieval presence
+_BETA  = 0.1167         # token efficiency
+_GAMMA = 0.1167         # logical consistency (no contradictions)
+_DELTA = 0.1167         # grounding / anti-hallucination
 
 
 def _retrieval_presence_score(retrieved_docs_per_node: dict[str, list]) -> float:

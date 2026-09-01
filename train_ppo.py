@@ -61,15 +61,29 @@ GAMMA = 0.99            # discount factor (episodes are single-step, so ≈1)
 
 # ── Question loader ────────────────────────────────────────────────────────────
 
-def load_questions(n: int | None = None) -> list[tuple[str, str]]:
+TRAIN_PATH = ROOT / "corpus" / "hotpot_train.jsonl"   # 500-question focused subset
+
+
+def load_questions(
+    n: int | None = None,
+    path: Path | None = None,
+) -> list[tuple[str, str]]:
     """Load (question, gold_answer) pairs from the HotpotQA corpus.
 
+    Parameters
+    ----------
+    n    : optional cap on number of questions returned
+    path : path to a .jsonl file; defaults to QUESTIONS_PATH (full 17k pool).
+           Pass TRAIN_PATH to focus training on the 500-question subset so
+           each question is seen more frequently and the policy converges faster.
+
     Returns a list of (question_text, gold_answer) tuples so that gold answers
-    can be threaded through rollout → compute_reward for the correctness term.
+    can be threaded through rollout -> compute_reward for the correctness term.
     """
-    if not QUESTIONS_PATH.exists():
+    src = path if path else QUESTIONS_PATH
+    if not src.exists():
         print(
-            f"[train_ppo] WARNING: {QUESTIONS_PATH} not found.\n"
+            f"[train_ppo] WARNING: {src} not found.\n"
             "  Run: python scripts/build_hotpot_subset.py\n"
             "  Using a single fallback question for smoke-testing.",
             file=sys.stderr,
@@ -77,7 +91,7 @@ def load_questions(n: int | None = None) -> list[tuple[str, str]]:
         return [("Who directed Inception and what year was it released?", "Christopher Nolan")]
     records = [
         json.loads(line)
-        for line in QUESTIONS_PATH.read_text(encoding="utf-8").splitlines()
+        for line in src.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
     pairs = [(r["question"], r.get("answer", "")) for r in records if "question" in r]
@@ -197,6 +211,7 @@ def train(
     resume: bool = True,
     max_questions: int | None = None,
     device: str = "cpu",
+    question_pool_path: Path | None = None,
 ) -> None:
     """Main PPO training loop.
 
@@ -205,11 +220,14 @@ def train(
 
     Parameters
     ----------
-    total_steps      : number of rollout episodes to run
-    checkpoint_every : save checkpoint every N steps
-    resume           : whether to load the latest checkpoint before starting
-    max_questions    : cap on how many questions to sample from (default: all)
-    device           : 'cpu' or 'cuda'
+    total_steps        : number of rollout episodes to run
+    checkpoint_every   : save checkpoint every N steps
+    resume             : whether to load the latest checkpoint before starting
+    max_questions      : cap on how many questions to sample from (default: all)
+    device             : 'cpu' or 'cuda'
+    question_pool_path : path to question file (default: full 17k pool).
+                         Pass TRAIN_PATH (500 questions) for focused training
+                         where each question repeats often, accelerating convergence.
     """
     from policies import (
         GraphEdgePolicy, RetrievalSelectPolicy, ContextKeepPolicy,
@@ -234,7 +252,8 @@ def train(
         )
 
     # ── Load questions ─────────────────────────────────────────────────────
-    questions = load_questions(max_questions)
+    questions = load_questions(max_questions, path=question_pool_path)
+    pool_label = (question_pool_path or QUESTIONS_PATH).name
     if not questions:
         print("[train_ppo] ERROR: No questions available. Exiting.")
         return
@@ -242,7 +261,7 @@ def train(
     print(
         f"\n{'='*60}\n"
         f"  RL-LAG Track B -- PPO Training\n"
-        f"  Questions: {len(questions)}   Device: {device}\n"
+        f"  Pool: {pool_label} ({len(questions)} questions)   Device: {device}\n"
         f"  Steps: {start_step} -> {start_step + total_steps}\n"
         f"  Clip eps={CLIP_EPS}  GAE lam={GAE_LAMBDA}  LR={LR}\n"
         f"{'='*60}\n"
@@ -364,6 +383,19 @@ if __name__ == "__main__":
                         help="Start fresh — ignore any existing checkpoints.")
     parser.add_argument("--questions", type=int, default=None,
                         help="Cap on how many questions to sample from (default: all 25).")
+    parser.add_argument(
+        "--question-pool",
+        default="train",
+        metavar="POOL",
+        help=(
+            "Which question pool to train on. Options:\n"
+            "  'train' (default) — hotpot_train.jsonl (500 questions, focused);\n"
+            "  'full'            — hotpot_questions.jsonl (17,388 questions);\n"
+            "  <path>            — any custom .jsonl file.\n"
+            "Focused training (train) repeats questions more often so the\n"
+            "policy converges faster and accuracy improves sooner."
+        ),
+    )
     parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"],
                         help="Torch device (default: cpu; use cuda on Kaggle T4).")
     parser.add_argument("--dry-run", action="store_true",
@@ -371,6 +403,16 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint-dir", type=Path, default=None,
                         help="Override checkpoint directory (e.g. /content/drive/MyDrive/rl-lag/checkpoints).")
     args = parser.parse_args()
+
+    # Resolve question pool path
+    _pool = args.question_pool.strip().lower()
+    if _pool == "train":
+        _qpool_path = TRAIN_PATH
+    elif _pool == "full":
+        _qpool_path = QUESTIONS_PATH
+    else:
+        _qpool_path = Path(args.question_pool)
+    print(f"[train_ppo] Question pool: {_qpool_path.name}")
 
     # Override checkpoint dir if provided (Colab/Kaggle use case)
     if args.checkpoint_dir:
@@ -389,6 +431,7 @@ if __name__ == "__main__":
                 resume=not args.no_resume,
                 max_questions=args.questions,
                 device=args.device,
+                question_pool_path=_qpool_path,
             )
     else:
         train(
@@ -397,4 +440,5 @@ if __name__ == "__main__":
             resume=not args.no_resume,
             max_questions=args.questions,
             device=args.device,
+            question_pool_path=_qpool_path,
         )
