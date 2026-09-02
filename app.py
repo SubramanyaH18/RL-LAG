@@ -16,7 +16,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from graph_builder import TYPE_COLORS, build_graph, render_graph, render_graph_interactive
-from llm_client import DEFAULT_MODEL, OLLAMA_HOST, get_usage_stats
+from llm_client import DEFAULT_MODEL, OLLAMA_HOST, get_usage_stats, reset_usage_stats
 from pipeline import run_pipeline_stream
 
 ROOT = Path(__file__).resolve().parent
@@ -36,10 +36,15 @@ with st.sidebar:
     use_cached = st.toggle("Use cached demo run", value=True)
     st.write(f"**Model:** `{DEFAULT_MODEL}`")
     st.write(f"**Ollama host:** `{OLLAMA_HOST}`")
-    stats = get_usage_stats()
-    st.metric("Live model calls", stats["requests"])
-    st.metric("Response cache hits", stats["cache_hits"])
-    st.caption("The counters cover the current Python process.")
+    _last_stats = st.session_state.get("last_run_stats")
+    if _last_stats is not None:
+        st.metric("Live model calls (last run)", _last_stats["requests"])
+        st.metric("Response cache hits (last run)", _last_stats["cache_hits"])
+        st.caption(
+            "Counters reset and measured fresh per pipeline run."
+        )
+    else:
+        st.caption("Run the pipeline once to see per-run model call stats.")
 
     st.divider()
     st.header("Corpus")
@@ -190,6 +195,9 @@ if run:
         run_from_cache = use_cached and question in cache_data
 
         if run_from_cache:
+            reset_usage_stats()
+            st.session_state["last_run_stats"] = get_usage_stats()
+
             result = cache_data[question]
             n_components = result.get("n_components", 1)  # A2
 
@@ -217,9 +225,11 @@ if run:
             st.subheader("4. Final answer")
             st.success(result["final_answer"])
             render_reward_section(result["reward"], len(result["subproblems"]))
+            st.caption("↩️ Replayed from demo_cache.json — 0 Ollama calls made this run.")
 
         else:
             # Live path — run full pipeline with Ollama
+            reset_usage_stats()
             subproblems: list[dict] = []
             node_placeholders: dict = {}
             status_area = st.container()
@@ -265,6 +275,13 @@ if run:
                         st.subheader("4. Final answer")
                         st.success(event["final_answer"])
                         render_reward_section(event["reward"], len(subproblems))
+                        _run_stats = get_usage_stats()
+                        st.session_state["last_run_stats"] = _run_stats
+                        st.caption(
+                            f"🟢 This run made **{_run_stats['requests']} live Ollama call(s)** "
+                            f"to `{DEFAULT_MODEL}` and reused **{_run_stats['cache_hits']} "
+                            f"cached response(s)** — confirming the model was actually reached."
+                        )
 
     except Exception as exc:
         st.error(str(exc))

@@ -63,32 +63,145 @@ GAMMA = 0.99            # discount factor (episodes are single-step, so ≈1)
 
 TRAIN_PATH = ROOT / "corpus" / "hotpot_train.jsonl"   # 500-question focused subset
 
+# Files with fewer questions than this threshold are treated as demo subsets;
+# load_questions() will auto-download the full set in that case.
+_FULL_HOTPOT_MIN = 1_000
+
+
+def download_full_hotpotqa(out_path: Path | None = None) -> Path:
+    """Download the full HotpotQA bridge+comparison question set from HuggingFace.
+
+    Filters to hard/medium bridge and comparison questions (multi-hop only).
+    Also writes corpus/hotpot_corpus.jsonl with all supporting paragraphs
+    so the FAISS index can be rebuilt from the full evidence base.
+
+    Returns the path to the written hotpot_questions.jsonl.
+    """
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        print(
+            "[train_ppo] ERROR: 'datasets' package not installed.\n"
+            "  Run: pip install datasets\n"
+            "  Then re-run training.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    dest = out_path or QUESTIONS_PATH
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    corpus_out = dest.parent / "hotpot_corpus.jsonl"
+
+    print("[train_ppo] Downloading HotpotQA from HuggingFace (~200 MB)...")
+    dataset = load_dataset("hotpotqa/hotpot_qa", "distractor", split="validation")
+    print(f"[train_ppo] HotpotQA validation set: {len(dataset):,} total questions")
+
+    # Keep only genuine multi-hop: hard/medium bridge + comparison
+    def _keep(ex: dict) -> bool:
+        return (
+            ex.get("level", "") in ("hard", "medium")
+            and ex.get("type", "") in ("bridge", "comparison")
+        )
+
+    filtered = [ex for ex in dataset if _keep(ex)]
+    print(f"[train_ppo] Multi-hop (hard/medium bridge+comparison): {len(filtered):,}")
+
+    import random as _rng
+    _rng.seed(42)
+    _rng.shuffle(filtered)
+
+    # ── Write all questions to hotpot_questions.jsonl ──────────────────────────
+    questions: list[dict] = []
+    for i, ex in enumerate(filtered):
+        supporting_titles = list(dict.fromkeys(ex["supporting_facts"]["title"]))
+        questions.append({
+            "id":                f"q_{i+1:05d}",
+            "question":          ex["question"],
+            "answer":            ex["answer"],
+            "type":              ex["type"],
+            "level":             ex["level"],
+            "supporting_titles": supporting_titles,
+        })
+
+    with dest.open("w", encoding="utf-8") as f:
+        for q in questions:
+            f.write(json.dumps(q, ensure_ascii=False) + "\n")
+
+    # ── Write supporting paragraphs to hotpot_corpus.jsonl ────────────────────
+    seen_texts: set[str] = set()
+    paragraphs: list[dict] = []
+    para_id = 0
+    for ex in filtered:
+        ctx = ex["context"]
+        for title, sents in zip(ctx["title"], ctx["sentences"]):
+            text = " ".join(s.strip() for s in sents).strip()
+            if not text or text in seen_texts:
+                continue
+            seen_texts.add(text)
+            paragraphs.append({
+                "id":    f"para_{para_id:05d}",
+                "title": title,
+                "text":  text,
+            })
+            para_id += 1
+
+    with corpus_out.open("w", encoding="utf-8") as f:
+        for p in paragraphs:
+            f.write(json.dumps(p, ensure_ascii=False) + "\n")
+
+    bridge_n = sum(1 for q in questions if q["type"] == "bridge")
+    comp_n   = sum(1 for q in questions if q["type"] == "comparison")
+    print(
+        f"[train_ppo] Saved {len(questions):,} questions "
+        f"({bridge_n:,} bridge + {comp_n:,} comparison) -> {dest}"
+    )
+    print(f"[train_ppo] Saved {len(paragraphs):,} paragraphs -> {corpus_out}")
+    return dest
+
 
 def load_questions(
     n: int | None = None,
     path: Path | None = None,
+    auto_download: bool = True,
 ) -> list[tuple[str, str]]:
     """Load (question, gold_answer) pairs from the HotpotQA corpus.
 
     Parameters
     ----------
-    n    : optional cap on number of questions returned
-    path : path to a .jsonl file; defaults to QUESTIONS_PATH (full 17k pool).
-           Pass TRAIN_PATH to focus training on the 500-question subset so
-           each question is seen more frequently and the policy converges faster.
+    n             : optional cap on number of questions returned
+    path          : path to a .jsonl file; defaults to QUESTIONS_PATH.
+    auto_download : if True and QUESTIONS_PATH has fewer than _FULL_HOTPOT_MIN
+                    questions (demo subset), automatically download the full set.
 
-    Returns a list of (question_text, gold_answer) tuples so that gold answers
-    can be threaded through rollout -> compute_reward for the correctness term.
+    Returns a list of (question_text, gold_answer) tuples.
     """
     src = path if path else QUESTIONS_PATH
+
+    # Auto-download when using the default path and the file is missing/tiny
+    if auto_download and src == QUESTIONS_PATH:
+        if not src.exists():
+            print(
+                f"[train_ppo] {src.name} not found — downloading full HotpotQA...",
+            )
+            download_full_hotpotqa(src)
+        else:
+            existing = sum(1 for l in src.open(encoding="utf-8") if l.strip())
+            if existing < _FULL_HOTPOT_MIN:
+                print(
+                    f"[train_ppo] {src.name} has only {existing} questions "
+                    f"(demo subset detected, threshold={_FULL_HOTPOT_MIN}). "
+                    "Downloading full HotpotQA now...",
+                )
+                download_full_hotpotqa(src)
+
     if not src.exists():
         print(
-            f"[train_ppo] WARNING: {src} not found.\n"
-            "  Run: python scripts/build_hotpot_subset.py\n"
-            "  Using a single fallback question for smoke-testing.",
+            f"[train_ppo] WARNING: {src} not found. "
+            "Using a single fallback question for smoke-testing.",
             file=sys.stderr,
         )
         return [("Who directed Inception and what year was it released?", "Christopher Nolan")]
+
     records = [
         json.loads(line)
         for line in src.read_text(encoding="utf-8").splitlines()
@@ -98,6 +211,7 @@ def load_questions(
     if n:
         pairs = pairs[:n]
     return pairs
+
 
 
 # ── GAE computation ───────────────────────────────────────────────────────────
