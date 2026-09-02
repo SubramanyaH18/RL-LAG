@@ -1,37 +1,47 @@
 """Minimal PPO training loop for RL-LAG Track B.
 
 Track B — B3:
-  Trains three small MLP policy networks (π^G, π^R, π^C from policies.py) using
-  Proximal Policy Optimization with:
-    - Clip ratio ε = 0.2         (matches the paper's stated hyperparameter)
-    - GAE λ = 0.95               (Generalized Advantage Estimation)
+  Trains three small MLP policy networks (pi^G, pi^R, pi^C from policies.py)
+  using Proximal Policy Optimization with:
+    - Clip ratio eps = 0.2       (matches the paper's stated hyperparameter)
+    - GAE lambda = 0.95          (Generalized Advantage Estimation)
     - Entropy bonus coeff = 0.01 (encourages exploration)
     - Value loss coeff = 0.5
     - Adam optimisers, lr = 3e-4 for all three policies
-    - Checkpoint every 50 rollout steps (resumable across Kaggle/Colab sessions)
+    - Checkpoint every 500 rollout steps (resumable across Colab/Kaggle sessions)
 
 The LLM (qwen2.5:3b-instruct via Ollama) is completely frozen throughout.
 
+Question pool
+-------------
+Training uses a fixed, seeded pool of 750 hard/medium bridge+comparison questions
+from HotpotQA (corpus/train_pool.json), built once by data_pools.py.  A separate
+300-question held-out eval pool (corpus/eval_pool.json) with zero overlap is used
+for all reported EM/F1 numbers.  Episode sampling is epoch-based (shuffle, exhaust,
+reshuffle) for even coverage.  See data_pools.py for config and EpochSampler.
+
 Usage
 -----
-    # Smoke test (10 steps, CPU, no Ollama needed if questions are cached)
-    python train_ppo.py --steps 10 --checkpoint-every 5
+    # Smoke test (dry-run, no Ollama needed)
+    python train_ppo.py --dry-run --steps 5 --skip-sanity
 
-    # Full local run (requires Ollama running)
-    python train_ppo.py --steps 200
+    # Pre-flight sanity check only (recommended before first training run)
+    python sanity_check.py
 
-    # Resume from latest checkpoint
-    python train_ppo.py --steps 500 --resume
+    # Full local run (requires Ollama running, pools built)
+    python train_ppo.py --steps 500 --checkpoint-every 100
 
-    # Kaggle T4 recommended for steps > 200
-    python train_ppo.py --steps 500 --checkpoint-every 50 --resume
+    # Resume from latest checkpoint (default behaviour)
+    python train_ppo.py --steps 1000 --checkpoint-every 500
+
+    # Colab/Kaggle T4 recommended run
+    python train_ppo.py --steps 2000 --checkpoint-every 500 --device cuda
 
 Honesty note
 ------------
-This trains on a frozen 3B local model on a 25-question (or modestly expanded)
-HotpotQA subset.  Results are a small-scale directional validation of the RL-LAG
-architecture, not a reproduction of the paper's 7B / 50k-rollout configuration.
-See reward.py docstring for the full disclaimer.
+Results are a small-scale directional validation of the RL-LAG architecture
+on a frozen 3B model, not a reproduction of the paper's 7B / 50k-rollout
+configuration.  See reward.py docstring for the full disclaimer.
 """
 from __future__ import annotations
 
@@ -59,158 +69,15 @@ PPO_EPOCHS = 4          # number of gradient steps per rollout batch
 GAMMA = 0.99            # discount factor (episodes are single-step, so ≈1)
 
 
-# ── Question loader ────────────────────────────────────────────────────────────
+# ── Question pool ─────────────────────────────────────────────────────────────
+# Fixed pools are managed by data_pools.py.
+# TRAIN_POOL_SIZE = 2000, EVAL_POOL_SIZE = 300 (derived from measured T4 timing).
+# Derivation: T4 ceiling ~26,000 eps/session; pool=2000 -> 13 epochs/session.
+from data_pools import load_train_pool, EpochSampler, TRAIN_POOL_SIZE, POOL_SEED
 
-TRAIN_PATH = ROOT / "corpus" / "hotpot_train.jsonl"   # 500-question focused subset
-
-# Files with fewer questions than this threshold are treated as demo subsets;
-# load_questions() will auto-download the full set in that case.
-_FULL_HOTPOT_MIN = 1_000
-
-
-def download_full_hotpotqa(out_path: Path | None = None) -> Path:
-    """Download the full HotpotQA bridge+comparison question set from HuggingFace.
-
-    Filters to hard/medium bridge and comparison questions (multi-hop only).
-    Also writes corpus/hotpot_corpus.jsonl with all supporting paragraphs
-    so the FAISS index can be rebuilt from the full evidence base.
-
-    Returns the path to the written hotpot_questions.jsonl.
-    """
-    try:
-        from datasets import load_dataset
-    except ImportError:
-        print(
-            "[train_ppo] ERROR: 'datasets' package not installed.\n"
-            "  Run: pip install datasets\n"
-            "  Then re-run training.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    dest = out_path or QUESTIONS_PATH
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    corpus_out = dest.parent / "hotpot_corpus.jsonl"
-
-    print("[train_ppo] Downloading HotpotQA from HuggingFace (~200 MB)...")
-    dataset = load_dataset("hotpotqa/hotpot_qa", "distractor", split="validation")
-    print(f"[train_ppo] HotpotQA validation set: {len(dataset):,} total questions")
-
-    # Keep only genuine multi-hop: hard/medium bridge + comparison
-    def _keep(ex: dict) -> bool:
-        return (
-            ex.get("level", "") in ("hard", "medium")
-            and ex.get("type", "") in ("bridge", "comparison")
-        )
-
-    filtered = [ex for ex in dataset if _keep(ex)]
-    print(f"[train_ppo] Multi-hop (hard/medium bridge+comparison): {len(filtered):,}")
-
-    import random as _rng
-    _rng.seed(42)
-    _rng.shuffle(filtered)
-
-    # ── Write all questions to hotpot_questions.jsonl ──────────────────────────
-    questions: list[dict] = []
-    for i, ex in enumerate(filtered):
-        supporting_titles = list(dict.fromkeys(ex["supporting_facts"]["title"]))
-        questions.append({
-            "id":                f"q_{i+1:05d}",
-            "question":          ex["question"],
-            "answer":            ex["answer"],
-            "type":              ex["type"],
-            "level":             ex["level"],
-            "supporting_titles": supporting_titles,
-        })
-
-    with dest.open("w", encoding="utf-8") as f:
-        for q in questions:
-            f.write(json.dumps(q, ensure_ascii=False) + "\n")
-
-    # ── Write supporting paragraphs to hotpot_corpus.jsonl ────────────────────
-    seen_texts: set[str] = set()
-    paragraphs: list[dict] = []
-    para_id = 0
-    for ex in filtered:
-        ctx = ex["context"]
-        for title, sents in zip(ctx["title"], ctx["sentences"]):
-            text = " ".join(s.strip() for s in sents).strip()
-            if not text or text in seen_texts:
-                continue
-            seen_texts.add(text)
-            paragraphs.append({
-                "id":    f"para_{para_id:05d}",
-                "title": title,
-                "text":  text,
-            })
-            para_id += 1
-
-    with corpus_out.open("w", encoding="utf-8") as f:
-        for p in paragraphs:
-            f.write(json.dumps(p, ensure_ascii=False) + "\n")
-
-    bridge_n = sum(1 for q in questions if q["type"] == "bridge")
-    comp_n   = sum(1 for q in questions if q["type"] == "comparison")
-    print(
-        f"[train_ppo] Saved {len(questions):,} questions "
-        f"({bridge_n:,} bridge + {comp_n:,} comparison) -> {dest}"
-    )
-    print(f"[train_ppo] Saved {len(paragraphs):,} paragraphs -> {corpus_out}")
-    return dest
-
-
-def load_questions(
-    n: int | None = None,
-    path: Path | None = None,
-    auto_download: bool = True,
-) -> list[tuple[str, str]]:
-    """Load (question, gold_answer) pairs from the HotpotQA corpus.
-
-    Parameters
-    ----------
-    n             : optional cap on number of questions returned
-    path          : path to a .jsonl file; defaults to QUESTIONS_PATH.
-    auto_download : if True and QUESTIONS_PATH has fewer than _FULL_HOTPOT_MIN
-                    questions (demo subset), automatically download the full set.
-
-    Returns a list of (question_text, gold_answer) tuples.
-    """
-    src = path if path else QUESTIONS_PATH
-
-    # Auto-download when using the default path and the file is missing/tiny
-    if auto_download and src == QUESTIONS_PATH:
-        if not src.exists():
-            print(
-                f"[train_ppo] {src.name} not found — downloading full HotpotQA...",
-            )
-            download_full_hotpotqa(src)
-        else:
-            existing = sum(1 for l in src.open(encoding="utf-8") if l.strip())
-            if existing < _FULL_HOTPOT_MIN:
-                print(
-                    f"[train_ppo] {src.name} has only {existing} questions "
-                    f"(demo subset detected, threshold={_FULL_HOTPOT_MIN}). "
-                    "Downloading full HotpotQA now...",
-                )
-                download_full_hotpotqa(src)
-
-    if not src.exists():
-        print(
-            f"[train_ppo] WARNING: {src} not found. "
-            "Using a single fallback question for smoke-testing.",
-            file=sys.stderr,
-        )
-        return [("Who directed Inception and what year was it released?", "Christopher Nolan")]
-
-    records = [
-        json.loads(line)
-        for line in src.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    pairs = [(r["question"], r.get("answer", "")) for r in records if "question" in r]
-    if n:
-        pairs = pairs[:n]
-    return pairs
+# Legacy path kept for --question-pool CLI compat and smoke-tests only.
+TRAIN_PATH      = ROOT / "corpus" / "train_pool.json"
+QUESTIONS_PATH  = ROOT / "corpus" / "hotpot_questions.jsonl"  # 25-q demo/smoke-test
 
 
 
@@ -320,28 +187,28 @@ def _build_batch(traj) -> _PolicyBatch | None:
 # ── Training loop ─────────────────────────────────────────────────────────────
 
 def train(
-    total_steps: int = 200,
-    checkpoint_every: int = 50,
-    resume: bool = True,
-    max_questions: int | None = None,
-    device: str = "cpu",
-    question_pool_path: Path | None = None,
+    total_steps:      int  = 26_000,   # T4 session ceiling: ~26,000 eps at 1.6 s/ep
+    checkpoint_every: int  = 500,
+    resume:           bool = True,
+    device:           str  = "cpu",
+    pool_size:        int  = TRAIN_POOL_SIZE,
+    skip_sanity:      bool = False,
 ) -> None:
     """Main PPO training loop.
 
     Each 'step' is one complete pipeline episode (one question).
     PPO updates happen after every episode (online PPO).
+    Episode sampling is epoch-based: the fixed pool is shuffled and exhausted
+    before reshuffling, giving guaranteed even coverage over each epoch.
 
     Parameters
     ----------
-    total_steps        : number of rollout episodes to run
-    checkpoint_every   : save checkpoint every N steps
-    resume             : whether to load the latest checkpoint before starting
-    max_questions      : cap on how many questions to sample from (default: all)
-    device             : 'cpu' or 'cuda'
-    question_pool_path : path to question file (default: full 17k pool).
-                         Pass TRAIN_PATH (500 questions) for focused training
-                         where each question repeats often, accelerating convergence.
+    total_steps      : number of rollout episodes to run
+    checkpoint_every : save checkpoint every N steps (default: 500)
+    resume           : load the latest checkpoint before starting
+    device           : 'cpu' or 'cuda'
+    pool_size        : training pool size; passed to load_train_pool()
+    skip_sanity      : if True, skip the pre-flight sanity check
     """
     from policies import (
         GraphEdgePolicy, RetrievalSelectPolicy, ContextKeepPolicy,
@@ -349,7 +216,29 @@ def train(
     )
     from rollout import run_rollout
 
-    # ── Init policies + optimizers ─────────────────────────────────────────
+    # ── Pre-flight sanity check ────────────────────────────────────────────────
+    if not skip_sanity:
+        try:
+            from sanity_check import run_sanity_check
+            run_sanity_check(n_questions=50, verbose=True)
+        except Exception as sc_err:
+            print(
+                f"[train_ppo] WARNING: sanity check raised an error: {sc_err}\n"
+                "  Continuing training. Run python sanity_check.py for details.",
+                file=sys.stderr,
+            )
+
+    # ── Load question pool via EpochSampler ────────────────────────────────────
+    pool_records = load_train_pool(pool_size=pool_size)
+    if not pool_records:
+        print("[train_ppo] ERROR: No questions in train pool. Exiting.")
+        return
+    # EpochSampler: shuffles pool into epochs (without replacement within each
+    # epoch) for even coverage.  If pure i.i.d. sampling is preferred, replace
+    # sampler.next() below with random.choice(pool_records).
+    sampler = EpochSampler(pool_records, seed=POOL_SEED)
+
+    # ── Init policies + optimizers ─────────────────────────────────────────────
     pi_G = GraphEdgePolicy().to(device)
     pi_R = RetrievalSelectPolicy().to(device)
     pi_C = ContextKeepPolicy().to(device)
@@ -357,42 +246,49 @@ def train(
     opt_R = torch.optim.Adam(pi_R.parameters(), lr=LR)
     opt_C = torch.optim.Adam(pi_C.parameters(), lr=LR)
 
-    # ── Resume from checkpoint ─────────────────────────────────────────────
+    # ── Resume from checkpoint ─────────────────────────────────────────────────
     start_step = 0
     reward_history: list[dict] = []
     if resume:
         start_step, reward_history = load_latest_checkpoint(
             pi_G, pi_R, pi_C, opt_G, opt_R, opt_C
         )
-
-    # ── Load questions ─────────────────────────────────────────────────────
-    questions = load_questions(max_questions, path=question_pool_path)
-    pool_label = (question_pool_path or QUESTIONS_PATH).name
-    if not questions:
-        print("[train_ppo] ERROR: No questions available. Exiting.")
-        return
+        # Restore sampler state if saved in checkpoint
+        import glob
+        ckpts = sorted(glob.glob(str(ROOT / "checkpoints" / "checkpoint_step_*.pt")))
+        if ckpts:
+            try:
+                import torch as _torch
+                ckpt = _torch.load(ckpts[-1], map_location="cpu")
+                if "sampler_state" in ckpt:
+                    sampler.load_state_dict(ckpt["sampler_state"])
+                    print(f"[train_ppo] Resumed EpochSampler at epoch {sampler.epoch}")
+            except Exception:
+                pass
 
     print(
-        f"\n{'='*60}\n"
+        f"\n{'='*62}\n"
         f"  RL-LAG Track B -- PPO Training\n"
-        f"  Pool: {pool_label} ({len(questions)} questions)   Device: {device}\n"
-        f"  Steps: {start_step} -> {start_step + total_steps}\n"
+        f"  Pool: train_pool.json ({len(pool_records)} questions)   Device: {device}\n"
+        f"  Sampler epoch: {sampler.epoch}   Steps: {start_step} -> {start_step + total_steps}\n"
         f"  Clip eps={CLIP_EPS}  GAE lam={GAE_LAMBDA}  LR={LR}\n"
-        f"{'='*60}\n"
+        f"{'='*62}\n"
     )
 
-    # ── Training loop ──────────────────────────────────────────────────────
+    # ── Training loop ──────────────────────────────────────────────────────────
     for global_step in range(start_step, start_step + total_steps):
-        question, gold_answer = random.choice(questions)
+        q_record = sampler.next()
+        question    = q_record["question"]
+        gold_answer = q_record.get("answer", "")
 
-        # ── Rollout ────────────────────────────────────────────────────────
+        # ── Rollout ────────────────────────────────────────────────────────────
         result = run_rollout(question, pi_G, pi_R, pi_C, gold_answer=gold_answer)
 
         if result.error:
             print(f"  [step {global_step:04d}] SKIP (error: {result.error[:60]})")
             continue
 
-        # ── PPO updates ────────────────────────────────────────────────────
+        # ── PPO updates ────────────────────────────────────────────────────────
         losses: dict[str, dict] = {}
         for name, policy, optimizer, traj in [
             ("G", pi_G, opt_G, result.traj_G),
@@ -405,7 +301,7 @@ def train(
             else:
                 losses[name] = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0}
 
-        # ── Logging ────────────────────────────────────────────────────────
+        # ── Logging ────────────────────────────────────────────────────────────
         comps = result.reward_components
         log_entry = {
             "step": global_step,
@@ -420,26 +316,24 @@ def train(
         reward_history.append(log_entry)
 
         print(
-            f"  [step {global_step:04d}] "
+            f"  [step {global_step:04d}|ep{sampler.epoch}] "
             f"reward={result.reward_score:+.4f}  "
             f"co={comps.get('correctness',0):.2f}  "
             f"rp={comps.get('retrieval_presence',0):.2f}  "
             f"te={comps.get('token_efficiency',0):.2f}  "
             f"lc={comps.get('logical_consistency',0):.2f}  "
             f"gr={comps.get('grounding',0):.2f}  "
-            f"G_loss={losses['G']['policy_loss']:.4f}  "
-            f"R_loss={losses['R']['policy_loss']:.4f}  "
-            f"C_loss={losses['C']['policy_loss']:.4f}  "
             f"({result.duration_s:.1f}s)"
         )
 
-        # ── Checkpoint ─────────────────────────────────────────────────────
+        # ── Checkpoint ─────────────────────────────────────────────────────────
         if (global_step + 1) % checkpoint_every == 0:
             save_checkpoint(
                 global_step + 1,
                 pi_G, pi_R, pi_C,
                 opt_G, opt_R, opt_C,
                 reward_history,
+                extra={"sampler_state": sampler.state_dict()},
             )
 
     # Final checkpoint
@@ -448,33 +342,34 @@ def train(
         pi_G, pi_R, pi_C,
         opt_G, opt_R, opt_C,
         reward_history,
+        extra={"sampler_state": sampler.state_dict()},
     )
 
     # Summary
     if reward_history:
         scores = [e["reward"] for e in reward_history]
         print(
-            f"\n{'='*60}\n"
+            f"\n{'='*62}\n"
             f"  Training complete.\n"
-            f"  Steps run : {len(scores)}\n"
-            f"  Mean reward: {sum(scores)/len(scores):+.4f}\n"
-            f"  Best reward: {max(scores):+.4f}\n"
-            f"  Checkpoints: checkpoints/\n"
-            f"{'='*60}\n"
+            f"  Steps run    : {len(scores)}\n"
+            f"  Sampler epoch: {sampler.epoch}\n"
+            f"  Mean reward  : {sum(scores)/len(scores):+.4f}\n"
+            f"  Best reward  : {max(scores):+.4f}\n"
+            f"  Checkpoints  : checkpoints/\n"
+            f"{'='*62}\n"
         )
 
 
-# ── CLI ───────────────────────────────────────────────────────────────────────
+# -- CLI -----------------------------------------------------------------------
 
-# ── Dry-run mock helpers ───────────────────────────────────────────────────────
+# -- Dry-run mock helpers -------------------------------------------------------
 
 _DRY_RUN_DECOMP = json.dumps([
     {"id": "q1", "text": "Who directed Inception?", "type": "factual", "depends_on": []},
     {"id": "q2", "text": "What year was Inception released?", "type": "temporal", "depends_on": ["q1"]},
 ])
 
-def _mock_llm(prompt: str, **kwargs) -> str:  # noqa: ARG001
-    """Deterministic stub for call_llm — returns plausible fixed answers."""
+def _mock_llm(prompt: str, **kwargs) -> str:
     p = prompt.lower()
     if "json" in p or "subproblem" in p:
         return _DRY_RUN_DECOMP
@@ -489,70 +384,43 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Train RL-LAG PPO policy networks (Track B)."
     )
-    parser.add_argument("--steps", type=int, default=200,
-                        help="Number of rollout episodes (default: 200).")
-    parser.add_argument("--checkpoint-every", type=int, default=50,
-                        help="Save checkpoint every N steps (default: 50).")
+    parser.add_argument("--steps", type=int, default=26_000,
+                        help="Number of rollout episodes (default: 26000 = T4 12h ceiling).")
+    parser.add_argument("--checkpoint-every", type=int, default=500,
+                        help="Save checkpoint every N steps (default: 500).")
     parser.add_argument("--no-resume", action="store_true",
-                        help="Start fresh — ignore any existing checkpoints.")
-    parser.add_argument("--questions", type=int, default=None,
-                        help="Cap on how many questions to sample from (default: all 25).")
-    parser.add_argument(
-        "--question-pool",
-        default="train",
-        metavar="POOL",
-        help=(
-            "Which question pool to train on. Options:\n"
-            "  'train' (default) — hotpot_train.jsonl (500 questions, focused);\n"
-            "  'full'            — hotpot_questions.jsonl (17,388 questions);\n"
-            "  <path>            — any custom .jsonl file.\n"
-            "Focused training (train) repeats questions more often so the\n"
-            "policy converges faster and accuracy improves sooner."
-        ),
-    )
+                        help="Start fresh -- ignore any existing checkpoints.")
+    parser.add_argument("--pool-size", type=int, default=TRAIN_POOL_SIZE,
+                        help=f"Fixed training pool size (default: {TRAIN_POOL_SIZE}).")
     parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"],
-                        help="Torch device (default: cpu; use cuda on Kaggle T4).")
+                        help="Torch device (default: cpu; use cuda on Colab/Kaggle T4).")
     parser.add_argument("--dry-run", action="store_true",
                         help="Use a mock LLM (no Ollama needed) to smoke-test the PPO loop.")
+    parser.add_argument("--skip-sanity", action="store_true",
+                        help="Skip the pre-flight sanity check (useful on resume runs).")
     parser.add_argument("--checkpoint-dir", type=Path, default=None,
-                        help="Override checkpoint directory (e.g. /content/drive/MyDrive/rl-lag/checkpoints).")
+                        help="Override checkpoint directory.")
     args = parser.parse_args()
 
-    # Resolve question pool path
-    _pool = args.question_pool.strip().lower()
-    if _pool == "train":
-        _qpool_path = TRAIN_PATH
-    elif _pool == "full":
-        _qpool_path = QUESTIONS_PATH
-    else:
-        _qpool_path = Path(args.question_pool)
-    print(f"[train_ppo] Question pool: {_qpool_path.name}")
-
-    # Override checkpoint dir if provided (Colab/Kaggle use case)
     if args.checkpoint_dir:
         import policies as _policies_mod
         _policies_mod.CHECKPOINT_DIR = args.checkpoint_dir
         print(f"[train_ppo] Checkpoint dir overridden -> {args.checkpoint_dir}")
+
+    _train_kwargs = dict(
+        total_steps=args.steps,
+        checkpoint_every=args.checkpoint_every,
+        resume=not args.no_resume,
+        device=args.device,
+        pool_size=args.pool_size,
+        skip_sanity=args.skip_sanity,
+    )
 
     if args.dry_run:
         print("[train_ppo] DRY-RUN mode: LLM calls replaced with deterministic mock.")
         with patch("llm_client.call_llm", side_effect=_mock_llm), \
              patch("decomposition.call_llm", side_effect=_mock_llm), \
              patch("solver.call_llm", side_effect=_mock_llm):
-            train(
-                total_steps=args.steps,
-                checkpoint_every=args.checkpoint_every,
-                resume=not args.no_resume,
-                max_questions=args.questions,
-                device=args.device,
-                question_pool_path=_qpool_path,
-            )
+            train(**_train_kwargs)
     else:
-        train(
-            total_steps=args.steps,
-            checkpoint_every=args.checkpoint_every,
-            resume=not args.no_resume,
-            max_questions=args.questions,
-            device=args.device,
-            question_pool_path=_qpool_path,
-        )
+        train(**_train_kwargs)

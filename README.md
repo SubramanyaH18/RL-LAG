@@ -1,58 +1,54 @@
 # RL-LAG Architectural Prototype — Ollama Edition
 
-This repository implements the uploaded RL-LAG prototype specification while replacing Groq with a **local Ollama model**. It demonstrates the pipeline shape only: LLM decomposition, dependency DAG construction, local FAISS retrieval, sequential node resolution, answer synthesis, and a rule-based reward placeholder.
-
-It does **not** train PPO, reproduce the paper's experimental results, fine-tune a model, or use a large corpus.
+This repository implements the RL-LAG prototype: multi-hop QA with RL-guided DAG
+reasoning over HotpotQA.  The LLM (qwen2.5:3b-instruct via Ollama) is frozen
+throughout; three small MLP policy networks (pi^G, pi^R, pi^C) are trained with PPO.
 
 ## Architecture
 
-1. `decomposition.py` converts a question into at most six atomic subproblems.
-2. `graph_builder.py` constructs and validates a NetworkX DAG.
-3. `retrieval.py` embeds the small local corpus and searches it with FAISS.
-4. `solver.py` resolves nodes in topological order through Ollama.
-5. `reward.py` computes an explicitly non-learned heuristic reward.
-6. `app.py` displays all stages in Streamlit.
-
-All Ollama calls pass through `llm_client.py`, which adds response caching, exponential retry, token/performance logging, and session counters.
+1. `decomposition.py` — converts a question into at most six atomic subproblems.
+2. `graph_builder.py` — constructs and validates a NetworkX DAG.
+3. `retrieval.py`     — local FAISS retriever (all-MiniLM-L6-v2) with context-aware
+                        query enrichment (A1), type-aware k (A3), and cosine dedup (A5).
+4. `solver.py`        — resolves nodes in topological order through Ollama.
+5. `reward.py`        — heuristic reward (correctness, retrieval presence, token efficiency,
+                        logical consistency, grounding).
+6. `policies.py`      — three MLP actor-critic networks + checkpoint I/O.
+7. `train_ppo.py`     — PPO training loop with epoch-based question sampling.
+8. `data_pools.py`    — builds and caches the fixed train + eval question pools.
+9. `sanity_check.py`  — pre-flight component validator (run before training).
+10. `eval.py`         — 4-way EM/F1 evaluation with McNemar + bootstrap statistics.
+11. `app.py`          — Streamlit UI for interactive demos.
 
 ## Prerequisites
 
-- Python 3.10 or newer
-- Ollama installed and running
-- A small local model pulled in Ollama
-
-The default model is `qwen2.5:3b-instruct`, keeping the project within the original specification's prohibition on 7B/13B/70B models. (Swapped from the earlier `llama3.2:3b` default — same size class, stronger instruction-following on the structured JSON prompts this pipeline relies on for decomposition/synthesis.)
+- Python 3.10+
+- Ollama installed and running with `qwen2.5:3b-instruct`
 
 ```bash
 ollama pull qwen2.5:3b-instruct
 ```
 
-## Corpus — HotpotQA Subset
+## Corpus and Question Pools
 
-The retrieval corpus is a **25-question, deduplicated-paragraph subset** of the
-[HotpotQA](https://hotpotqa.github.io/) `validation` / `distractor` split.
+| File | Questions | Purpose |
+|------|-----------|---------|
+| `corpus/train_pool.json`        | **2000** (fixed seed 42) | PPO training — epoch-sampled |
+| `corpus/eval_pool.json`         | **300** (zero overlap)   | All reported EM/F1 results  |
+| `corpus/hotpot_questions.jsonl` | 25                       | Smoke-test / Streamlit demo only |
 
-> **Important:** This is NOT the full HotpotQA dataset (90 k+ training questions)
-> and NOT the paper's 21 M-passage Wikipedia retrieval index.
-> It is a small, fixed-seed sample intended for local architectural demonstration only.
+All questions are `hard`/`medium` `bridge`+`comparison` from HotpotQA validation/distractor.
 
-- Split: `validation` (distractor config)
-- Filter: `level ∈ {hard, medium}` AND `type ∈ {bridge, comparison}`
-- Sample size: 25 questions (seed 42 — deterministic)
-- Paragraphs: deduplicated across all 25 examples' context fields
+> **Pool size derivation:** Measured dry-run (PPO + FAISS) = 0.82 s/ep; real local (+ Ollama CPU)
+> = 3.1 s/ep mean; Kaggle T4 estimate = 1.6 s/ep (3× GPU speedup). T4 session ceiling ≈ 26,000
+> episodes. `pool=2000` → **13 epochs/session** — squarely in the 5–15 epoch sweet spot.
 
-### One-time corpus build
+### One-time pool build
 
 ```powershell
-pip install datasets          # already in requirements.txt
-python scripts/build_hotpot_subset.py
+pip install datasets
+python data_pools.py          # downloads HotpotQA once, writes both pool files
 ```
-
-This produces:
-- `corpus/hotpot_corpus.jsonl` — paragraphs for FAISS indexing
-- `corpus/hotpot_questions.jsonl` — questions for the Streamlit dropdown
-
----
 
 ## Setup
 
@@ -63,7 +59,8 @@ python -m venv venv
 .\venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 Copy-Item .env.example .env
-python scripts/build_hotpot_subset.py   # one-time corpus build
+python data_pools.py                  # one-time: build train + eval pools
+python scripts/build_hotpot_subset.py # one-time: build 25-q demo corpus for Streamlit
 streamlit run app.py
 ```
 
@@ -74,17 +71,70 @@ python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
-python scripts/build_hotpot_subset.py   # one-time corpus build
+python data_pools.py
+python scripts/build_hotpot_subset.py
 streamlit run app.py
 ```
 
-Ollama normally exposes its local API at `http://localhost:11434`. Change `.env` when your daemon or model differs.
+## PPO Training
 
-## Demo mode
+```powershell
+# Pre-flight sanity check (recommended before first run)
+python sanity_check.py
 
-The sidebar toggle **Use cached demo run** replays pre-recorded HotpotQA runs from
-`demo_cache.json` with zero Ollama calls. Disable it to use live local inference
-(requires Ollama running with `qwen2.5:3b-instruct`).
+# Full T4 run — 26,000 steps, checkpoint every 500
+python train_ppo.py --steps 26000 --checkpoint-every 500 --device cuda
+
+# Resume (skip sanity check to save ~2 min on resume)
+python train_ppo.py --steps 26000 --checkpoint-every 500 --device cuda --skip-sanity
+
+# Dry-run (no Ollama needed)
+python train_ppo.py --dry-run --steps 5 --skip-sanity
+
+# Local CPU (slower, for testing only)
+python train_ppo.py --steps 500 --checkpoint-every 100 --skip-sanity
+```
+
+Sampling is **epoch-based**: the 2000-question pool is shuffled and exhausted before
+reshuffling. One Kaggle T4 session (12h) ≈ **13 epochs** (~26,000 episodes).
+The current epoch is shown in the step log: `[step 04200|ep3]`.
+
+## Evaluation
+
+```powershell
+# Full 4-way eval on the 300-question held-out eval pool (for reported results)
+python eval.py
+
+# Baseline only (no Ollama needed)
+python eval.py --eval-mode baseline-only
+
+# Fast smoke-test on the 25-question demo subset (not for reported results)
+python eval.py --smoke-test --eval-mode baseline-only
+
+# Skip statistical tests (faster)
+python eval.py --no-stats
+```
+
+`results.json` contains:
+- `summary`     — EM/F1 per condition
+- `statistics`  — McNemar p-values and bootstrap 95% CI on F1 (PPO vs each baseline)
+- `per_question` — per-question predictions
+- `metadata`    — pool description and training steps
+
+## Sanity Check
+
+```powershell
+python sanity_check.py            # first run records baseline to sanity_baseline.json
+python sanity_check.py            # subsequent runs compare vs baseline, warn on drops
+python sanity_check.py --dry-run  # mock LLM, no Ollama needed
+python sanity_check.py --reset-baseline  # re-record after intentional code changes
+```
+
+Four checks are run on 50 training-pool questions:
+- **A** Decomposition validity rate (valid DAG, no cycles, non-trivial)
+- **B** Retrieval A1 context-enrichment effect (% nodes where top-5 set changes)
+- **C** Dedup A5 activity (mean passages removed by 0.92 cosine threshold)
+- **D** Type-aware k A3 behaviour (temporal/comparative k bounds)
 
 ## Test
 
@@ -94,7 +144,10 @@ pytest -q
 
 ## Notes
 
-- The first live run downloads the `all-MiniLM-L6-v2` embedding model unless it is already cached.
 - The FAISS index is rebuilt only when the corpus or embedding model changes.
-- Ollama has no Groq free-tier request limit, so Groq-specific `Retry-After` and quota logic has been replaced by transient-failure retries and local usage metrics.
-- Live answer quality depends on the local Ollama model. The included cached demonstrations are deterministic presentation fallbacks.
+- Checkpoint files include the EpochSampler state, so training resumes with correct
+  epoch position even after a session break.
+- All reported numbers come from `eval_pool.json` (300 held-out questions).
+  The 25-question demo file is used only for Streamlit and smoke-tests.
+- Ollama has no request-rate limit, so Groq-specific quota logic has been replaced
+  by transient-failure retries and local usage metrics.

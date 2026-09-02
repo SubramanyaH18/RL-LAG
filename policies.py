@@ -1,28 +1,28 @@
 """Three lightweight actor-critic MLP policy networks for RL-LAG Track B PPO.
 
-Architecture (Track B — B1):
-  π^G  graph-edge policy     — decides keep/drop for each LLM-proposed DAG edge
-  π^R  retrieval-select policy — decides include/exclude for each retrieved passage
-  π^C  context-keep policy   — decides keep/discard for passage in running context
+Architecture (Track B -- B1):
+  pi^G  graph-edge policy      -- decides keep/drop for each LLM-proposed DAG edge
+  pi^R  retrieval-select policy -- decides include/exclude for each retrieved passage
+  pi^C  context-keep policy    -- decides keep/discard for passage in running context
 
 Design constraints (from roadmap):
-  - Hidden size 256–512, matching the paper's own architecture choice
-  - 2–3 layer MLP with ReLU activations
+  - Hidden size 256-512, matching the paper's own architecture choice
+  - 2-3 layer MLP with ReLU activations
   - Bernoulli action space for each binary decision
   - Actor + critic heads share the same trunk (standard A2C/PPO pattern)
-  - All embeddings use all-MiniLM-L6-v2 (384-dim) — already loaded by retrieval.py
+  - All embeddings use all-MiniLM-L6-v2 (384-dim) -- already loaded by retrieval.py
 
 Observation spaces:
-  π^G  : [src_type_onehot(4), tgt_type_onehot(4), n_nodes_norm(1), n_edges_norm(1)]
-          total dim = 10
-  π^R  : [passage_emb(384), query_emb(384)]   total dim = 768
-  π^C  : [passage_emb(384), ctx_len_norm(1)]  total dim = 385
+  pi^G  : [src_type_onehot(4), tgt_type_onehot(4), n_nodes_norm(1), n_edges_norm(1)]
+           total dim = 10
+  pi^R  : [passage_emb(384), query_emb(384)]   total dim = 768
+  pi^C  : [passage_emb(384), ctx_len_norm(1)]  total dim = 385
 
-Honesty note (carried over from reward.py):
+Honesty note:
   These networks are trained on a frozen 3B local model (qwen2.5:3b-instruct via Ollama),
-  not the paper's fine-tuned 7B backbone.  Training targets a few hundred to
-  ~1,000 rollouts on a 25-question HotpotQA subset, not 50,000 rollouts on 21M
-  Wikipedia passages.  Results are a small-scale directional validation of the
+  not the paper's fine-tuned 7B backbone.  Training uses epoch-based sampling over a
+  fixed 750-question train pool (corpus/train_pool.json), with a separate 300-question
+  held-out eval pool.  Results are a small-scale directional validation of the
   RL-LAG optimization layer.
 """
 from __future__ import annotations
@@ -216,25 +216,33 @@ def save_checkpoint(
     opt_R: torch.optim.Optimizer,
     opt_C: torch.optim.Optimizer,
     reward_history: list[dict],
+    extra: dict | None = None,
 ) -> Path:
-    """Save all three policy + optimizer states to checkpoints/checkpoint_step_NNN.pt."""
+    """Save all three policy + optimizer states to checkpoints/checkpoint_step_NNN.pt.
+
+    Parameters
+    ----------
+    extra : Optional dict of additional data to store in the checkpoint
+            (e.g. {'sampler_state': sampler.state_dict()} for EpochSampler resume).
+    """
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     path = CHECKPOINT_DIR / f"checkpoint_step_{step:04d}.pt"
-    torch.save(
-        {
-            "step": step,
-            "pi_G_state": pi_G.state_dict(),
-            "pi_R_state": pi_R.state_dict(),
-            "pi_C_state": pi_C.state_dict(),
-            "opt_G_state": opt_G.state_dict(),
-            "opt_R_state": opt_R.state_dict(),
-            "opt_C_state": opt_C.state_dict(),
-            "reward_history": reward_history,
-        },
-        path,
-    )
+    payload = {
+        "step": step,
+        "pi_G_state": pi_G.state_dict(),
+        "pi_R_state": pi_R.state_dict(),
+        "pi_C_state": pi_C.state_dict(),
+        "opt_G_state": opt_G.state_dict(),
+        "opt_R_state": opt_R.state_dict(),
+        "opt_C_state": opt_C.state_dict(),
+        "reward_history": reward_history,
+    }
+    if extra:
+        payload.update(extra)
+    torch.save(payload, path)
     print(f"[checkpoint] saved -> {path}")
     return path
+
 
 
 def load_latest_checkpoint(

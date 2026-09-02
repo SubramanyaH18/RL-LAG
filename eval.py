@@ -57,8 +57,12 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-QUESTIONS_PATH = ROOT / "corpus" / "hotpot_questions.jsonl"
-DEFAULT_OUT = ROOT / "results.json"
+# Reported results always use the held-out eval pool (300 questions, zero
+# overlap with the training pool).  The 25-question demo file is kept only
+# as a fast smoke-test and is NOT used for any reported numbers.
+EVAL_POOL_PATH  = ROOT / "corpus" / "eval_pool.json"
+SMOKE_TEST_PATH = ROOT / "corpus" / "hotpot_questions.jsonl"   # 25-q demo subset
+DEFAULT_OUT     = ROOT / "results.json"
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +70,7 @@ DEFAULT_OUT = ROOT / "results.json"
 # ---------------------------------------------------------------------------
 
 def _normalize(text: str) -> str:
-    """Lowercase, strip punctuation and articles — matches the official HotpotQA eval."""
+    """Lowercase, strip punctuation and articles -- matches the official HotpotQA eval."""
     text = text.lower()
     text = text.translate(str.maketrans("", "", string.punctuation))
     text = re.sub(r"\b(a|an|the)\b", " ", text)
@@ -86,16 +90,15 @@ def f1_score(prediction: str, gold: str) -> float:
     if not common:
         return 0.0
     precision = len(common) / len(pred_tokens)
-    recall = len(common) / len(gold_tokens)
+    recall    = len(common) / len(gold_tokens)
     return 2 * precision * recall / (precision + recall)
 
 
 # ---------------------------------------------------------------------------
-# Condition (a): zero-shot baseline — top-1 passage retrieval, no LLM
+# Condition (a): zero-shot baseline
 # ---------------------------------------------------------------------------
 
 def run_baseline(question: str) -> str:
-    """Retrieve the top passage and return it as the answer (no LLM call)."""
     from retrieval import retrieve
     docs = retrieve(question, k=1)
     if docs:
@@ -104,45 +107,35 @@ def run_baseline(question: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Condition (c): rule-based pipeline — no PPO policy networks
+# Condition (c): rule-based pipeline
 # ---------------------------------------------------------------------------
 
 def run_pipeline(question: str) -> str:
-    """Run the full RL-LAG pipeline and return the final answer string."""
     from pipeline import run_pipeline as _run
     result = _run(question)
     return result.get("final_answer", "")
 
 
 # ---------------------------------------------------------------------------
-# Condition (b): random-init policy networks (freshly instantiated)
+# Condition (b): random-init policy networks
 # ---------------------------------------------------------------------------
 
 def run_with_random_policies(question: str) -> str:
-    """Run the full pipeline with freshly-initialized (random) policy networks.
-
-    This serves as the 'untrained RL baseline' — the policy networks exist but
-    have not received any PPO gradient updates.  Comparing against condition (d)
-    shows whether training actually improved the policies.
-    """
     from policies import get_all_policies
     from rollout import run_rollout
-
     pi_G, pi_R, pi_C = get_all_policies()
     result = run_rollout(question, pi_G, pi_R, pi_C)
     return result.final_answer
 
 
 # ---------------------------------------------------------------------------
-# Condition (d): PPO-trained policy networks (loaded from checkpoint)
+# Condition (d): PPO-trained policy networks
 # ---------------------------------------------------------------------------
 
-# Module-level cache so we don't reload the checkpoint for every question.
 _trained_policies = None
 
 
 def _get_trained_policies():
-    """Load trained policy networks from the latest checkpoint (cached)."""
     global _trained_policies
     if _trained_policies is not None:
         return _trained_policies
@@ -156,7 +149,6 @@ def _get_trained_policies():
     pi_G = GraphEdgePolicy()
     pi_R = RetrievalSelectPolicy()
     pi_C = ContextKeepPolicy()
-    # Dummy optimizers required by load_latest_checkpoint API.
     opt_G = torch.optim.Adam(pi_G.parameters(), lr=1e-4)
     opt_R = torch.optim.Adam(pi_R.parameters(), lr=1e-4)
     opt_C = torch.optim.Adam(pi_C.parameters(), lr=1e-4)
@@ -169,27 +161,23 @@ def _get_trained_policies():
             file=sys.stderr,
         )
 
-    pi_G.eval()
-    pi_R.eval()
-    pi_C.eval()
+    pi_G.eval(); pi_R.eval(); pi_C.eval()
     _trained_policies = (pi_G, pi_R, pi_C, step)
     return _trained_policies
 
 
 def run_with_trained_policies(question: str) -> str:
-    """Run the full pipeline with PPO-trained policy networks from checkpoint."""
     from rollout import run_rollout
-
     pi_G, pi_R, pi_C, _ = _get_trained_policies()
     result = run_rollout(question, pi_G, pi_R, pi_C)
     return result.final_answer
 
 
 # ---------------------------------------------------------------------------
-# Question loader
+# Question loaders
 # ---------------------------------------------------------------------------
 
-def load_questions(path: Path, n: int | None) -> list[dict]:
+def _load_jsonl(path: Path, n: int | None) -> list[dict]:
     records = [
         json.loads(line)
         for line in path.read_text(encoding="utf-8").splitlines()
@@ -200,64 +188,171 @@ def load_questions(path: Path, n: int | None) -> list[dict]:
     return records
 
 
+def load_questions(path: Path, n: int | None) -> list[dict]:
+    """Back-compat wrapper used by tests."""
+    return _load_jsonl(path, n)
+
+
+def _load_eval_pool(n: int | None) -> list[dict]:
+    """Load the held-out eval pool (300 questions). Builds it if missing."""
+    if not EVAL_POOL_PATH.exists():
+        print("[eval] eval_pool.json not found -- building pools now...")
+        from data_pools import build_pools
+        build_pools()
+    obj = json.loads(EVAL_POOL_PATH.read_text("utf-8"))
+    qs  = obj.get("questions", obj) if isinstance(obj, dict) else obj
+    if n is not None:
+        qs = qs[:n]
+    return qs
+
+
 # ---------------------------------------------------------------------------
-# Evaluation loop — supports 4-way comparison
+# Statistical tests
 # ---------------------------------------------------------------------------
 
-# Registered condition runners — maps condition name to (runner_fn, needs_llm).
+def _mcnemar(em_a: list[float], em_b: list[float]) -> float:
+    """McNemar's test p-value (two-sided) for two paired EM score lists.
+
+    Returns the p-value.  Uses chi-squared approximation (continuity-corrected)
+    when b+c >= 25, and the exact binomial otherwise.
+    """
+    import math
+    b = sum(1 for a, bb in zip(em_a, em_b) if a == 1.0 and bb == 0.0)
+    c = sum(1 for a, bb in zip(em_a, em_b) if a == 0.0 and bb == 1.0)
+    n_disc = b + c
+    if n_disc == 0:
+        return 1.0
+    if n_disc >= 25:
+        chi2 = (abs(b - c) - 1.0) ** 2 / (b + c)
+        # One-tailed survival of chi2 with df=1, approximated via erfc
+        p = math.erfc(math.sqrt(chi2 / 2))
+        return round(float(p), 6)
+    # Exact binomial (two-sided): sum of binom(n, min(b,c)) terms
+    smaller = min(b, c)
+    p = 0.0
+    binom = 1.0
+    # Pre-compute binom(n_disc, 0)
+    for k in range(n_disc + 1):
+        if k == 0:
+            binom = 0.5 ** n_disc
+        else:
+            binom = binom * (n_disc - k + 1) / k
+        if k <= smaller or k >= n_disc - smaller:
+            p += binom
+    return round(min(1.0, p * 2), 6)
+
+
+def _bootstrap_f1_ci(
+    f1_a: list[float],
+    f1_b: list[float],
+    n_resample: int = 1000,
+    seed: int = 0,
+) -> dict:
+    """Paired bootstrap resampling for mean F1 difference (B - A).
+
+    Returns {'mean_diff': float, 'ci_low': float, 'ci_high': float, 'p_value': float}.
+    ci_low/ci_high are the 95% CI on the mean F1 difference.
+    p_value is the fraction of resamples where the difference was <= 0.
+    """
+    import random as _rng
+    _rng.seed(seed)
+    n = len(f1_a)
+    observed_diff = sum(f1_b) / n - sum(f1_a) / n
+    diffs = []
+    for _ in range(n_resample):
+        indices = [_rng.randint(0, n - 1) for _ in range(n)]
+        sample_a = sum(f1_a[i] for i in indices) / n
+        sample_b = sum(f1_b[i] for i in indices) / n
+        diffs.append(sample_b - sample_a)
+    diffs.sort()
+    ci_low  = diffs[int(0.025 * n_resample)]
+    ci_high = diffs[int(0.975 * n_resample)]
+    p_val   = sum(1 for d in diffs if d <= 0.0) / n_resample
+    return {
+        "mean_diff": round(observed_diff, 4),
+        "ci_low":    round(ci_low, 4),
+        "ci_high":   round(ci_high, 4),
+        "p_value":   round(p_val, 4),
+    }
+
+
+def compute_statistics(per_question: list[dict], conditions: list[str]) -> dict:
+    """Compute McNemar's test and bootstrap CI for all condition pairs vs PPO-trained."""
+    stats: dict = {}
+    reference = "ppo_trained_policy"
+    if reference not in conditions:
+        return stats
+
+    ref_em = [q.get(reference, {}).get("em", 0.0) for q in per_question]
+    ref_f1 = [q.get(reference, {}).get("f1", 0.0) for q in per_question]
+
+    for cond in conditions:
+        if cond == reference:
+            continue
+        cond_em = [q.get(cond, {}).get("em", 0.0) for q in per_question]
+        cond_f1 = [q.get(cond, {}).get("f1", 0.0) for q in per_question]
+        key = f"{reference}_vs_{cond}"
+        stats[key] = {
+            "mcnemar_p_value": _mcnemar(ref_em, cond_em),
+            "bootstrap_f1":    _bootstrap_f1_ci(cond_f1, ref_f1),
+            "note": f"ppo_trained_policy F1 - {cond} F1 (positive = PPO better)",
+        }
+    return stats
+
+
+# ---------------------------------------------------------------------------
+# Evaluation loop
+# ---------------------------------------------------------------------------
+
 _CONDITIONS = {
-    "zero_shot_baseline":  (run_baseline, False),
-    "random_init_policy":  (run_with_random_policies, True),
-    "rule_based_pipeline": (run_pipeline, True),
+    "zero_shot_baseline":  (run_baseline,              False),
+    "random_init_policy":  (run_with_random_policies,  True),
+    "rule_based_pipeline": (run_pipeline,              True),
     "ppo_trained_policy":  (run_with_trained_policies, True),
 }
 
 
 def evaluate(
-    questions: list[dict],
+    questions:  list[dict],
     conditions: list[str] | None = None,
+    run_stats:  bool = True,
 ) -> dict:
     """Run EM/F1 evaluation across one or more conditions.
 
     Parameters
     ----------
-    questions : list[dict]
-        Question records with at least 'question' and 'answer' fields.
-    conditions : list[str] or None
-        Which conditions to evaluate.  None = all four.
-        Valid names: zero_shot_baseline, random_init_policy,
-                     rule_based_pipeline, ppo_trained_policy.
+    questions  : list[dict] with at least 'question' and 'answer' fields.
+    conditions : Which conditions to evaluate.  None = all four.
+    run_stats  : Whether to compute McNemar + bootstrap statistics.
     """
     if conditions is None:
         conditions = list(_CONDITIONS.keys())
 
     per_question: list[dict] = []
-    totals: dict[str, dict[str, float]] = {
-        c: {"em": 0.0, "f1": 0.0} for c in conditions
-    }
+    totals: dict[str, dict[str, float]] = {c: {"em": 0.0, "f1": 0.0} for c in conditions}
 
     n = len(questions)
     for idx, q in enumerate(questions, start=1):
         question_text = q.get("question", "")
-        gold = q.get("answer", "")
-        q_type = q.get("type", "unknown")
-        q_level = q.get("level", "unknown")
+        gold          = q.get("answer", "")
+        q_type        = q.get("type", "unknown")
+        q_level       = q.get("level", "unknown")
 
         print(f"[{idx}/{n}] {question_text[:70]}...", flush=True)
 
         entry: dict = {
             "question": question_text,
-            "gold": gold,
-            "type": q_type,
-            "level": q_level,
+            "gold":     gold,
+            "type":     q_type,
+            "level":    q_level,
         }
 
         for cond in conditions:
             runner_fn, _ = _CONDITIONS[cond]
             try:
                 pred = runner_fn(question_text)
-                em = exact_match(pred, gold)
-                f1 = f1_score(pred, gold)
+                em   = exact_match(pred, gold)
+                f1   = f1_score(pred, gold)
             except Exception as exc:
                 print(f"  {cond} error: {exc}", flush=True)
                 pred = f"ERROR: {exc}"
@@ -280,18 +375,16 @@ def evaluate(
         for cond in conditions
     }
 
-    # Metadata for honest reporting.
     metadata = {
         "model": "qwen2.5:3b-instruct (frozen, via Ollama)",
-        "corpus_passages": 87590,
+        "eval_pool": "eval_pool.json (300 held-out questions, zero overlap with train_pool)",
         "note": (
-            "Small-scale directional validation.  Trained on a frozen 3B model, "
-            "a few hundred to ~1,000 rollouts on a HotpotQA subset, not the "
-            "original paper's 7B backbone / 50k rollouts / 21M-passage index."
+            "Small-scale directional validation. Trained on a frozen 3B model "
+            "with epoch-based sampling over a fixed 750-question train pool. "
+            "Not comparable to the paper's 7B / 50k-rollout / 21M-passage configuration."
         ),
     }
 
-    # Add training step count if we loaded a checkpoint.
     if "ppo_trained_policy" in conditions:
         try:
             _, _, _, step = _get_trained_policies()
@@ -299,7 +392,17 @@ def evaluate(
         except Exception:
             pass
 
-    return {"summary": summary, "per_question": per_question, "metadata": metadata}
+    statistics: dict = {}
+    if run_stats and len(conditions) > 1:
+        print("\n[eval] Computing McNemar + bootstrap statistics...", flush=True)
+        statistics = compute_statistics(per_question, conditions)
+
+    return {
+        "summary":     summary,
+        "per_question": per_question,
+        "statistics":  statistics,
+        "metadata":    metadata,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -307,53 +410,64 @@ def evaluate(
 # ---------------------------------------------------------------------------
 
 _EVAL_MODES = {
-    "all": list(_CONDITIONS.keys()),
-    "baseline-only": ["zero_shot_baseline"],
+    "all":              list(_CONDITIONS.keys()),
+    "baseline-only":    ["zero_shot_baseline"],
     "baseline-pipeline": ["zero_shot_baseline", "rule_based_pipeline"],
-    "trained-only": ["ppo_trained_policy"],
+    "trained-only":     ["ppo_trained_policy"],
+    "ppo-only":         ["ppo_trained_policy"],
 }
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Evaluate the RL-LAG pipeline against the HotpotQA subset."
+        description="Evaluate the RL-LAG pipeline against the HotpotQA eval pool."
     )
     parser.add_argument(
-        "--questions",
-        type=int,
-        default=None,
-        metavar="N",
-        help="Evaluate only the first N questions (default: all).",
+        "--questions", type=int, default=None, metavar="N",
+        help="Evaluate only the first N questions (default: all in pool).",
     )
     parser.add_argument(
-        "--out",
-        type=Path,
-        default=DEFAULT_OUT,
+        "--out", type=Path, default=DEFAULT_OUT,
         help=f"Output JSON file (default: {DEFAULT_OUT}).",
     )
     parser.add_argument(
-        "--baseline-only",
-        action="store_true",
-        help="Run only the baseline retrieval; skip the full pipeline. "
-             "(Legacy flag — prefer --eval-mode baseline-only.)",
+        "--baseline-only", action="store_true",
+        help="Run only the baseline retrieval. (Legacy flag -- prefer --eval-mode baseline-only.)",
     )
     parser.add_argument(
-        "--eval-mode",
-        choices=list(_EVAL_MODES.keys()),
-        default=None,
-        help="Which conditions to evaluate (default: 'all').",
+        "--eval-mode", choices=list(_EVAL_MODES.keys()), default=None,
+        help="Which conditions to evaluate (default: all).",
+    )
+    parser.add_argument(
+        "--smoke-test", action="store_true",
+        help=(
+            "Use the 25-question demo subset (hotpot_questions.jsonl) instead of "
+            "eval_pool.json.  Fast, but NOT used for any reported results."
+        ),
+    )
+    parser.add_argument(
+        "--no-stats", action="store_true",
+        help="Skip McNemar / bootstrap statistics (faster).",
     )
     args = parser.parse_args()
 
-    if not QUESTIONS_PATH.exists():
+    if args.smoke_test:
+        if not SMOKE_TEST_PATH.exists():
+            print(
+                f"ERROR: {SMOKE_TEST_PATH} not found.\n"
+                "Run: python scripts/build_hotpot_subset.py",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        questions = _load_jsonl(SMOKE_TEST_PATH, args.questions)
         print(
-            f"ERROR: {QUESTIONS_PATH} not found.\n"
-            "Run: python scripts/build_hotpot_subset.py",
-            file=sys.stderr,
+            f"[eval] SMOKE-TEST mode: {len(questions)} questions from "
+            f"{SMOKE_TEST_PATH.name}  (not for reported results)"
         )
-        sys.exit(1)
+    else:
+        questions = _load_eval_pool(args.questions)
+        print(f"[eval] Eval pool: {len(questions)} questions from {EVAL_POOL_PATH.name}")
 
-    # Resolve conditions.
     if args.baseline_only:
         conditions = ["zero_shot_baseline"]
     elif args.eval_mode:
@@ -361,28 +475,42 @@ def main() -> None:
     else:
         conditions = _EVAL_MODES["all"]
 
-    questions = load_questions(QUESTIONS_PATH, args.questions)
-    print(
-        f"Evaluating {len(questions)} questions — "
-        f"conditions: {', '.join(conditions)}\n"
-    )
+    print(f"Conditions: {', '.join(conditions)}\n")
 
     t0 = time.time()
-    results = evaluate(questions, conditions=conditions)
+    results = evaluate(questions, conditions=conditions, run_stats=not args.no_stats)
     elapsed = time.time() - t0
 
     args.out.write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"\nResults written to {args.out}  ({elapsed:.1f}s)")
 
-    # Print summary table.
-    print("\n--- Summary ------------------------------------")
+    print("\n--- Summary -----------------------------------------------")
     for system, metrics in results["summary"].items():
         print(
             f"  {system:<24}  EM={metrics['em']:.4f}  F1={metrics['f1']:.4f}"
             f"  (n={metrics['n']})"
         )
-    print("------------------------------------------")
+
+    if results.get("statistics"):
+        print("\n--- Statistical Tests (PPO-trained vs others) ------------")
+        for pair, s in results["statistics"].items():
+            bs = s["bootstrap_f1"]
+            print(
+                f"  {pair}\n"
+                f"    McNemar p = {s['mcnemar_p_value']:.4f}\n"
+                f"    F1 diff   = {bs['mean_diff']:+.4f}  "
+                f"95% CI [{bs['ci_low']:+.4f}, {bs['ci_high']:+.4f}]  "
+                f"bootstrap p = {bs['p_value']:.4f}"
+            )
+    print("-----------------------------------------------------------")
 
 
 if __name__ == "__main__":
     main()
+
+
+
+# ---------------------------------------------------------------------------
+# EM / F1 helpers  (standard HotpotQA evaluation style)
+# ---------------------------------------------------------------------------
+
